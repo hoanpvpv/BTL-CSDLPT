@@ -4,6 +4,7 @@
 #
 
 import psycopg2
+import io
 
 DATABASE_NAME = 'dds_assgn1'
 
@@ -14,14 +15,26 @@ def getopenconnection(user='postgres', password='1234', dbname='postgres'):
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
-    Function to load data in @ratingsfilepath file to a table called @ratingstablename.
+    Load data from ratingsfilepath into ratingstablename efficiently.
     """
-    create_db(DATABASE_NAME)
     con = openconnection
     cur = con.cursor()
-    cur.execute("create table " + ratingstablename + "(userid integer, extra1 char, movieid integer, extra2 char, rating float, extra3 char, timestamp bigint);")
-    cur.copy_from(open(ratingsfilepath), ratingstablename, sep=':')
-    cur.execute("alter table " + ratingstablename + " drop column extra1, drop column extra2, drop column extra3, drop column timestamp;")
+    # Tạo bảng đúng schema
+    cur.execute("DROP TABLE IF EXISTS %s;" % ratingstablename)
+    cur.execute("CREATE TABLE %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % ratingstablename)
+
+    # Đọc file, chỉ lấy 3 trường cần thiết, ghi vào buffer
+    buffer = io.StringIO()
+    with open(ratingsfilepath, 'r') as f:
+        for line in f:
+            fields = line.strip().split(':')
+            if len(fields) >= 5:
+                buffer.write("%s\t%s\t%s\n" % (fields[0], fields[2], fields[4]))
+    buffer.seek(0)
+
+    # Nạp dữ liệu vào bảng
+    cur.copy_from(buffer, ratingstablename, sep='\t', columns=('userid', 'movieid', 'rating'))
+    buffer.close()
     cur.close()
     con.commit()
 
@@ -32,17 +45,27 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     con = openconnection
     cur = con.cursor()
-    delta = 5 / numberofpartitions
+    delta = 5.0 / numberofpartitions  # float division
     RANGE_TABLE_PREFIX = 'range_part'
-    for i in range(0, numberofpartitions):
+    for i in range(numberofpartitions):
         minRange = i * delta
-        maxRange = minRange + delta
+        # Partition cuối cùng lấy hết đến 5.0
+        maxRange = 5.0 if i == numberofpartitions - 1 else (i + 1) * delta
         table_name = RANGE_TABLE_PREFIX + str(i)
-        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
+        cur.execute("DROP TABLE IF EXISTS %s;" % table_name)
+        cur.execute("CREATE TABLE %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % table_name)
         if i == 0:
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating >= " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+            cur.execute(
+                "INSERT INTO %s (userid, movieid, rating) "
+                "SELECT userid, movieid, rating FROM %s WHERE rating >= %%s AND rating <= %%s;" % (table_name, ratingstablename),
+                (minRange, maxRange)
+            )
         else:
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating > " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+            cur.execute(
+                "INSERT INTO %s (userid, movieid, rating) "
+                "SELECT userid, movieid, rating FROM %s WHERE rating > %%s AND rating <= %%s;" % (table_name, ratingstablename),
+                (minRange, maxRange)
+            )
     cur.close()
     con.commit()
 
@@ -54,47 +77,77 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     con = openconnection
     cur = con.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
-    for i in range(0, numberofpartitions):
+
+    # Tạo các bảng phân mảnh (nếu chưa tồn tại)
+    for i in range(numberofpartitions):
         table_name = RROBIN_TABLE_PREFIX + str(i)
-        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
-        cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from (select userid, movieid, rating, ROW_NUMBER() over() as rnum from " + ratingstablename + ") as temp where mod(temp.rnum-1, " + str(numberofpartitions) + ") = " + str(i) + ";")
+        cur.execute("CREATE TABLE IF NOT EXISTS %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % table_name)
+
+    # Tạo bảng tạm với row_number để chỉ tính 1 lần
+    cur.execute("""
+        CREATE TEMP TABLE temp_rr AS
+        SELECT userid, movieid, rating, (ROW_NUMBER() OVER() - 1) AS rnum
+        FROM %s;
+    """ % ratingstablename)
+
+    # Chèn dữ liệu vào từng partition
+    for i in range(numberofpartitions):
+        table_name = RROBIN_TABLE_PREFIX + str(i)
+        cur.execute(
+            "INSERT INTO %s (userid, movieid, rating) "
+            "SELECT userid, movieid, rating FROM temp_rr WHERE MOD(rnum, %%s) = %%s;" % table_name,
+            (numberofpartitions, i)
+        )
+
+    # Xóa bảng tạm
+    cur.execute("DROP TABLE temp_rr;")
     cur.close()
     con.commit()
 
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on round robin
-    approach.
+    Insert a new row into the main table and the correct round robin partition.
     """
     con = openconnection
     cur = con.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
-    cur.execute("insert into " + ratingstablename + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
-    cur.execute("select count(*) from " + ratingstablename + ";");
-    total_rows = (cur.fetchall())[0][0]
+    # Tham số hóa truy vấn
+    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % ratingstablename, (userid, itemid, rating))
+    cur.execute("SELECT COUNT(*) FROM %s;" % ratingstablename)
+    total_rows = cur.fetchone()[0]
     numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
+    if numberofpartitions == 0:
+        cur.close()
+        con.commit()
+        return
     index = (total_rows - 1) % numberofpartitions
     table_name = RROBIN_TABLE_PREFIX + str(index)
-    cur.execute("insert into " + table_name + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
+    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % table_name, (userid, itemid, rating))
     cur.close()
     con.commit()
 
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on range rating.
+    Insert a new row into the main table and the correct range partition.
     """
     con = openconnection
     cur = con.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
     numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
-    delta = 5 / numberofpartitions
+    if numberofpartitions == 0:
+        cur.close()
+        con.commit()
+        return
+    delta = 5.0 / numberofpartitions
     index = int(rating / delta)
     if rating % delta == 0 and index != 0:
-        index = index - 1
+        index -= 1
+    if index >= numberofpartitions:
+        index = numberofpartitions - 1
     table_name = RANGE_TABLE_PREFIX + str(index)
-    cur.execute("insert into " + table_name + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
+    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % table_name, (userid, itemid, rating))
     cur.close()
     con.commit()
 
