@@ -13,6 +13,26 @@ def getopenconnection(user='postgres', password='1234', dbname='postgres'):
     return psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
 
 
+def create_metadata_table(openconnection):
+    """
+    Tạo bảng metadata để lưu trữ thông tin về các phân mảnh
+    """
+    cur = openconnection.cursor()
+    
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS partition_metadata (
+            partition_type VARCHAR(10) NOT NULL,
+            partition_count INTEGER NOT NULL,
+            total_rows INTEGER NOT NULL DEFAULT 0,
+            last_insert_idx INTEGER DEFAULT 0,
+            PRIMARY KEY (partition_type)
+        );
+    """)
+    
+    openconnection.commit()
+    cur.close()
+
+
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
     Load data from ratingsfilepath into ratingstablename efficiently.
@@ -41,115 +61,202 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table based on range of ratings.
+    Tạo phân mảnh dựa trên khoảng giá trị rating và cập nhật metadata
     """
-    con = openconnection
-    cur = con.cursor()
-    delta = 5.0 / numberofpartitions  # float division
+    cur = openconnection.cursor()
+    
+    # Tạo bảng metadata nếu chưa tồn tại
+    create_metadata_table(openconnection)
+    
+    delta = 5.0 / numberofpartitions
     RANGE_TABLE_PREFIX = 'range_part'
+
+    # Tạo các phân mảnh mới
     for i in range(numberofpartitions):
         minRange = i * delta
-        # Partition cuối cùng lấy hết đến 5.0
         maxRange = 5.0 if i == numberofpartitions - 1 else (i + 1) * delta
         table_name = RANGE_TABLE_PREFIX + str(i)
-        cur.execute("DROP TABLE IF EXISTS %s;" % table_name)
-        cur.execute("CREATE TABLE %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % table_name)
+
+        cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
         if i == 0:
             cur.execute(
-                "INSERT INTO %s (userid, movieid, rating) "
-                "SELECT userid, movieid, rating FROM %s WHERE rating >= %%s AND rating <= %%s;" % (table_name, ratingstablename),
+                f"INSERT INTO {table_name} (userid, movieid, rating) "
+                f"SELECT userid, movieid, rating FROM {ratingstablename} WHERE rating >= %s AND rating <= %s;",
                 (minRange, maxRange)
             )
         else:
             cur.execute(
-                "INSERT INTO %s (userid, movieid, rating) "
-                "SELECT userid, movieid, rating FROM %s WHERE rating > %%s AND rating <= %%s;" % (table_name, ratingstablename),
+                f"INSERT INTO {table_name} (userid, movieid, rating) "
+                f"SELECT userid, movieid, rating FROM {ratingstablename} WHERE rating > %s AND rating <= %s;",
                 (minRange, maxRange)
             )
+    
+    # Lấy tổng số bản ghi và lưu vào metadata
+    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+    total_rows = cur.fetchone()[0]
+    
+    # Cập nhật metadata
+    cur.execute("""
+        INSERT INTO partition_metadata (partition_type, partition_count, total_rows)
+        VALUES ('range', %s, %s);
+    """, (numberofpartitions, total_rows))
+    
+    openconnection.commit()
     cur.close()
-    con.commit()
 
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table using round robin approach.
+    Tạo phân mảnh theo kiểu round robin và cập nhật metadata
     """
-    con = openconnection
-    cur = con.cursor()
+    cur = openconnection.cursor()
+    
+    # Tạo bảng metadata nếu chưa tồn tại
+    create_metadata_table(openconnection)
+    
     RROBIN_TABLE_PREFIX = 'rrobin_part'
 
-    # Tạo các bảng phân mảnh (nếu chưa tồn tại)
+    # Tạo các bảng phân mảnh
     for i in range(numberofpartitions):
         table_name = RROBIN_TABLE_PREFIX + str(i)
-        cur.execute("CREATE TABLE IF NOT EXISTS %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % table_name)
+        cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
 
-    # Tạo bảng tạm với row_number để chỉ tính 1 lần
-    cur.execute("""
+    # Sử dụng bảng tạm với row_number
+    cur.execute(f"""
         CREATE TEMP TABLE temp_rr AS
         SELECT userid, movieid, rating, (ROW_NUMBER() OVER() - 1) AS rnum
-        FROM %s;
-    """ % ratingstablename)
+        FROM {ratingstablename};
+    """)
 
     # Chèn dữ liệu vào từng partition
     for i in range(numberofpartitions):
         table_name = RROBIN_TABLE_PREFIX + str(i)
         cur.execute(
-            "INSERT INTO %s (userid, movieid, rating) "
-            "SELECT userid, movieid, rating FROM temp_rr WHERE MOD(rnum, %%s) = %%s;" % table_name,
+            f"INSERT INTO {table_name} (userid, movieid, rating) "
+            f"SELECT userid, movieid, rating FROM temp_rr WHERE MOD(rnum, %s) = %s;",
             (numberofpartitions, i)
         )
 
     # Xóa bảng tạm
     cur.execute("DROP TABLE temp_rr;")
+    
+    # Lấy tổng số bản ghi và lưu vào metadata
+    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+    total_rows = cur.fetchone()[0]
+    last_idx = (total_rows - 1) % numberofpartitions if total_rows > 0 else 0
+    
+    # Cập nhật metadata
+    cur.execute("""
+        INSERT INTO partition_metadata (partition_type, partition_count, total_rows, last_insert_idx)
+        VALUES ('rrobin', %s, %s, %s);
+    """, (numberofpartitions, total_rows, last_idx))
+    
+    openconnection.commit()
     cur.close()
-    con.commit()
 
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Insert a new row into the main table and the correct round robin partition.
+    Chèn dữ liệu vào bảng chính và phân mảnh theo round robin, dùng metadata
     """
-    con = openconnection
-    cur = con.cursor()
+    cur = openconnection.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
-    # Tham số hóa truy vấn
-    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % ratingstablename, (userid, itemid, rating))
-    cur.execute("SELECT COUNT(*) FROM %s;" % ratingstablename)
-    total_rows = cur.fetchone()[0]
-    numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
-    if numberofpartitions == 0:
+    
+    # Lấy thông tin từ metadata
+    cur.execute("""
+        SELECT partition_count, total_rows, last_insert_idx
+        FROM partition_metadata
+        WHERE partition_type = 'rrobin';
+    """)
+    
+    result = cur.fetchone()
+    if not result:
+        # Chỉ chèn vào bảng chính nếu không có metadata
+        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
+                   (userid, itemid, rating))
+        openconnection.commit()
         cur.close()
-        con.commit()
         return
-    index = (total_rows - 1) % numberofpartitions
-    table_name = RROBIN_TABLE_PREFIX + str(index)
-    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % table_name, (userid, itemid, rating))
+    
+    numberofpartitions, total_rows, last_insert_idx = result
+    
+    # Chèn vào bảng chính
+    cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
+               (userid, itemid, rating))
+    
+    # Tính toán partition kế tiếp
+    next_idx = (last_insert_idx + 1) % numberofpartitions
+    table_name = f"{RROBIN_TABLE_PREFIX}{next_idx}"
+    
+    # Chèn vào phân mảnh
+    cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s);",
+               (userid, itemid, rating))
+    
+    # Cập nhật metadata
+    cur.execute("""
+        UPDATE partition_metadata
+        SET total_rows = total_rows + 1, last_insert_idx = %s
+        WHERE partition_type = 'rrobin';
+    """, (next_idx,))
+    
+    openconnection.commit()
     cur.close()
-    con.commit()
 
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Insert a new row into the main table and the correct range partition.
+    Chèn dữ liệu vào bảng chính và phân mảnh theo range, dùng metadata
     """
-    con = openconnection
-    cur = con.cursor()
+    cur = openconnection.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
-    numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
-    if numberofpartitions == 0:
+    
+    # Lấy thông tin từ metadata
+    cur.execute("""
+        SELECT partition_count
+        FROM partition_metadata
+        WHERE partition_type = 'range';
+    """)
+    
+    result = cur.fetchone()
+    if not result:
+        # Chỉ chèn vào bảng chính nếu không có metadata
+        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
+                   (userid, itemid, rating))
+        openconnection.commit()
         cur.close()
-        con.commit()
         return
+    
+    numberofpartitions = result[0]
+    
+    # Chèn vào bảng chính
+    cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
+               (userid, itemid, rating))
+    
+    # Tính toán partition phù hợp
     delta = 5.0 / numberofpartitions
     index = int(rating / delta)
+    
+    # Xử lý các trường hợp đặc biệt
     if rating % delta == 0 and index != 0:
         index -= 1
     if index >= numberofpartitions:
         index = numberofpartitions - 1
-    table_name = RANGE_TABLE_PREFIX + str(index)
-    cur.execute("INSERT INTO %s (userid, movieid, rating) VALUES (%%s, %%s, %%s);" % table_name, (userid, itemid, rating))
+        
+    table_name = f"{RANGE_TABLE_PREFIX}{index}"
+    
+    # Chèn vào phân mảnh
+    cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s);",
+               (userid, itemid, rating))
+    
+    # Cập nhật metadata
+    cur.execute("""
+        UPDATE partition_metadata
+        SET total_rows = total_rows + 1
+        WHERE partition_type = 'range';
+    """)
+    
+    openconnection.commit()
     cur.close()
-    con.commit()
 
 
 def create_db(dbname):
@@ -176,14 +283,29 @@ def create_db(dbname):
     con.close()
 
 
-def count_partitions(prefix, openconnection):
+def count_partitions(partition_type, openconnection):
     """
-    Function to count the number of tables which have the @prefix in their name somewhere.
+    Lấy số lượng phân mảnh từ bảng metadata
     """
-    con = openconnection
-    cur = con.cursor()
-    cur.execute("select count(*) from pg_stat_user_tables where relname like " + "'" + prefix + "%';")
-    count = cur.fetchone()[0]
+    cur = openconnection.cursor()
+    
+    # Kiểm tra partition_type hợp lệ
+    if partition_type == 'range':
+        search_type = 'range'
+    elif partition_type == 'rrobin_part':
+        search_type = 'rrobin'
+    else:
+        cur.close()
+        return 0
+    
+    cur.execute("""
+        SELECT partition_count
+        FROM partition_metadata
+        WHERE partition_type = %s;
+    """, (search_type,))
+    
+    result = cur.fetchone()
+    count = result[0] if result else 0
+    
     cur.close()
-
     return count
