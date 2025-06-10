@@ -39,22 +39,36 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
     con = openconnection
     cur = con.cursor()
+    
     # Tạo bảng đúng schema
     cur.execute("DROP TABLE IF EXISTS %s;" % ratingstablename)
     cur.execute("CREATE TABLE %s (userid INTEGER, movieid INTEGER, rating FLOAT);" % ratingstablename)
 
     # Đọc file, chỉ lấy 3 trường cần thiết, ghi vào buffer
     buffer = io.StringIO()
+    row_count = 0  # Biến đếm số bản ghi
     with open(ratingsfilepath, 'r') as f:
         for line in f:
             fields = line.strip().split(':')
             if len(fields) >= 5:
                 buffer.write("%s\t%s\t%s\n" % (fields[0], fields[2], fields[4]))
+                row_count += 1  # Đếm số bản ghi
     buffer.seek(0)
 
     # Nạp dữ liệu vào bảng
     cur.copy_from(buffer, ratingstablename, sep='\t', columns=('userid', 'movieid', 'rating'))
     buffer.close()
+
+    # Tạo bảng metadata nếu chưa tồn tại
+    create_metadata_table(openconnection)
+
+    # Lưu thông tin số bản ghi vào bảng metadata
+    cur.execute("""
+        INSERT INTO partition_metadata (partition_type, partition_count, total_rows)
+        VALUES ('original', 1, %s)
+        ON CONFLICT (partition_type) DO UPDATE SET total_rows = %s;
+    """, (row_count, row_count))
+
     cur.close()
     con.commit()
 
@@ -68,6 +82,26 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
     # Tạo bảng metadata nếu chưa tồn tại
     create_metadata_table(openconnection)
     
+    # Lấy tổng số bản ghi từ metadata
+    cur.execute("""
+        SELECT total_rows FROM partition_metadata 
+        WHERE partition_type = 'original';
+    """)
+    
+    result = cur.fetchone()
+    total_rows = result[0] if result else 0
+    
+    # Nếu không có thông tin trong metadata, thực hiện đếm (phòng hờ)
+    if total_rows == 0:
+        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+        total_rows = cur.fetchone()[0]
+        # Cập nhật lại metadata original
+        cur.execute("""
+            INSERT INTO partition_metadata (partition_type, partition_count, total_rows)
+            VALUES ('original', 1, %s)
+            ON CONFLICT (partition_type) DO UPDATE SET total_rows = %s;
+        """, (total_rows, total_rows))
+    
     delta = 5.0 / numberofpartitions
     RANGE_TABLE_PREFIX = 'range_part'
 
@@ -77,6 +111,7 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         maxRange = 5.0 if i == numberofpartitions - 1 else (i + 1) * delta
         table_name = RANGE_TABLE_PREFIX + str(i)
 
+        cur.execute(f"DROP TABLE IF EXISTS {table_name};")
         cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
         if i == 0:
             cur.execute(
@@ -90,17 +125,16 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
                 f"SELECT userid, movieid, rating FROM {ratingstablename} WHERE rating > %s AND rating <= %s;",
                 (minRange, maxRange)
             )
-    
-    # Lấy tổng số bản ghi và lưu vào metadata
-    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
-    total_rows = cur.fetchone()[0]
-    
+
     # Cập nhật metadata
     cur.execute("""
         INSERT INTO partition_metadata (partition_type, partition_count, total_rows)
-        VALUES ('range', %s, %s);
-    """, (numberofpartitions, total_rows))
-    
+        VALUES ('range', %s, %s)
+        ON CONFLICT (partition_type) DO UPDATE SET
+            partition_count = %s,
+            total_rows = %s;
+    """, (numberofpartitions, total_rows, numberofpartitions, total_rows))
+
     openconnection.commit()
     cur.close()
 
@@ -110,15 +144,36 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     Tạo phân mảnh theo kiểu round robin và cập nhật metadata
     """
     cur = openconnection.cursor()
-    
+
     # Tạo bảng metadata nếu chưa tồn tại
     create_metadata_table(openconnection)
-    
+
+    # Lấy tổng số bản ghi từ metadata
+    cur.execute("""
+        SELECT total_rows FROM partition_metadata 
+        WHERE partition_type = 'original';
+    """)
+
+    result = cur.fetchone()
+    total_rows = result[0] if result else 0
+
+    # Nếu không có thông tin trong metadata, thực hiện đếm (phòng hờ)
+    if total_rows == 0:
+        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+        total_rows = cur.fetchone()[0]
+        # Cập nhật lại metadata original
+        cur.execute("""
+            INSERT INTO partition_metadata (partition_type, partition_count, total_rows)
+            VALUES ('original', 1, %s)
+            ON CONFLICT (partition_type) DO UPDATE SET total_rows = %s;
+        """, (total_rows, total_rows))
+
     RROBIN_TABLE_PREFIX = 'rrobin_part'
 
     # Tạo các bảng phân mảnh
     for i in range(numberofpartitions):
         table_name = RROBIN_TABLE_PREFIX + str(i)
+        cur.execute(f"DROP TABLE IF EXISTS {table_name};")
         cur.execute(f"CREATE TABLE {table_name} (userid INTEGER, movieid INTEGER, rating FLOAT);")
 
     # Sử dụng bảng tạm với row_number
@@ -139,17 +194,19 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
 
     # Xóa bảng tạm
     cur.execute("DROP TABLE temp_rr;")
-    
-    # Lấy tổng số bản ghi và lưu vào metadata
-    cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
-    total_rows = cur.fetchone()[0]
+
+    # Tính chỉ số phân mảnh cuối cùng
     last_idx = (total_rows - 1) % numberofpartitions if total_rows > 0 else 0
-    
+
     # Cập nhật metadata
     cur.execute("""
         INSERT INTO partition_metadata (partition_type, partition_count, total_rows, last_insert_idx)
-        VALUES ('rrobin', %s, %s, %s);
-    """, (numberofpartitions, total_rows, last_idx))
+        VALUES ('rrobin', %s, %s, %s)
+        ON CONFLICT (partition_type) DO UPDATE SET 
+            partition_count = %s,
+            total_rows = %s,
+            last_insert_idx = %s;
+    """, (numberofpartitions, total_rows, last_idx, numberofpartitions, total_rows, last_idx))
     
     openconnection.commit()
     cur.close()
@@ -170,35 +227,34 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """)
     
     result = cur.fetchone()
-    if not result:
-        # Chỉ chèn vào bảng chính nếu không có metadata
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
-                   (userid, itemid, rating))
-        openconnection.commit()
-        cur.close()
-        return
-    
     numberofpartitions, total_rows, last_insert_idx = result
-    
+
     # Chèn vào bảng chính
     cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
                (userid, itemid, rating))
-    
+
     # Tính toán partition kế tiếp
     next_idx = (last_insert_idx + 1) % numberofpartitions
     table_name = f"{RROBIN_TABLE_PREFIX}{next_idx}"
-    
+
     # Chèn vào phân mảnh
     cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s);",
                (userid, itemid, rating))
-    
-    # Cập nhật metadata
+
+        # Cập nhật metadata
     cur.execute("""
         UPDATE partition_metadata
         SET total_rows = total_rows + 1, last_insert_idx = %s
         WHERE partition_type = 'rrobin';
-    """, (next_idx,))
-    
+    """, (next_idx,))  # Thêm tham số next_idx vào đây
+
+    # Cập nhật metadata original nếu có
+    cur.execute("""
+        UPDATE partition_metadata
+        SET total_rows = total_rows + 1
+        WHERE partition_type = 'original';
+    """)
+
     openconnection.commit()
     cur.close()
 
@@ -209,52 +265,52 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     cur = openconnection.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
-    
+
     # Lấy thông tin từ metadata
     cur.execute("""
         SELECT partition_count
         FROM partition_metadata
         WHERE partition_type = 'range';
     """)
-    
+
     result = cur.fetchone()
-    if not result:
-        # Chỉ chèn vào bảng chính nếu không có metadata
-        cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
-                   (userid, itemid, rating))
-        openconnection.commit()
-        cur.close()
-        return
-    
+
     numberofpartitions = result[0]
-    
+
     # Chèn vào bảng chính
     cur.execute(f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
                (userid, itemid, rating))
-    
+
     # Tính toán partition phù hợp
     delta = 5.0 / numberofpartitions
     index = int(rating / delta)
-    
+
     # Xử lý các trường hợp đặc biệt
     if rating % delta == 0 and index != 0:
         index -= 1
     if index >= numberofpartitions:
         index = numberofpartitions - 1
-        
+
     table_name = f"{RANGE_TABLE_PREFIX}{index}"
-    
+
     # Chèn vào phân mảnh
     cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) VALUES (%s, %s, %s);",
                (userid, itemid, rating))
-    
+
     # Cập nhật metadata
     cur.execute("""
         UPDATE partition_metadata
         SET total_rows = total_rows + 1
         WHERE partition_type = 'range';
     """)
-    
+
+    # Cập nhật metadata original nếu có
+    cur.execute("""
+        UPDATE partition_metadata
+        SET total_rows = total_rows + 1
+        WHERE partition_type = 'original';
+    """)
+
     openconnection.commit()
     cur.close()
 
@@ -288,7 +344,7 @@ def count_partitions(partition_type, openconnection):
     Lấy số lượng phân mảnh từ bảng metadata
     """
     cur = openconnection.cursor()
-    
+
     # Kiểm tra partition_type hợp lệ
     if partition_type == 'range':
         search_type = 'range'
@@ -297,15 +353,15 @@ def count_partitions(partition_type, openconnection):
     else:
         cur.close()
         return 0
-    
+
     cur.execute("""
         SELECT partition_count
         FROM partition_metadata
         WHERE partition_type = %s;
     """, (search_type,))
-    
+
     result = cur.fetchone()
     count = result[0] if result else 0
-    
+
     cur.close()
     return count
